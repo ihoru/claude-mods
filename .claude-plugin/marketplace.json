@@ -1,0 +1,11 @@
+{
+  "name": "claude-mods",
+  "owner": { "name": "ihoru" },
+  "plugins": [
+    {
+      "name": "open-in-pycharm",
+      "source": "./open-in-pycharm",
+      "description": "/pycharm opens the session's project in PyCharm (Linux, macOS, Windows)"
+    }
+  ]
+}
