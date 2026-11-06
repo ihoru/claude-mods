@@ -85,15 +85,60 @@ async function findPyCharm(run: Run, os: Os): Promise<string | undefined> {
   }
 }
 
+type Spot = { project: string; file?: string; line?: number; column?: number }
+
+// `path`, `path:line` or `path:line:col`; a drive colon (C:\x.py:12) stays in the path.
+function parseSpec(spec: string): { path: string; line?: number; column?: number } {
+  const m = /^(.*?)(?::(\d+))?(?::(\d+))?$/.exec(spec) ?? []
+  const [, path = spec, a, b] = m
+  if (a !== undefined && b !== undefined) return { path, line: Number(a), column: Number(b) }
+
+  return a !== undefined ? { path, line: Number(a) } : { path }
+}
+
+async function isFile(run: Run, os: Os, path: string): Promise<boolean> {
+  try {
+    const { exitCode } =
+      os === 'windows'
+        ? await run(powershell(`if (Test-Path -LiteralPath ${ps(path)} -PathType Leaf) { exit 0 } else { exit 1 }`))
+        : await run(['test', '-f', path])
+
+    return exitCode === 0
+  } catch {
+    return false
+  }
+}
+
+const isAbsolute = (os: Os, path: string): boolean =>
+  os === 'windows' ? /^([A-Za-z]:[\\/]|\\\\)/.test(path) : path.startsWith('/')
+
+// Turns what the person typed into a project folder, plus a file and line when it names a file.
+async function resolveSpot($: EngineInterface, run: Run, os: Os, spec: string): Promise<Spot> {
+  const cwd = await $.session.cwd()
+  if (!spec) return { project: cwd }
+  const { path, line, column } = parseSpec(spec)
+  let full = path
+  if (full.startsWith('~/')) full = `${(await $.env.get('HOME')) ?? ''}${full.slice(1)}`
+  if (!isAbsolute(os, full)) full = `${cwd}${os === 'windows' ? '\\' : '/'}${full}`
+  if (await isFile(run, os, full)) return { project: cwd, file: full, line, column }
+
+  return { project: full }
+}
+
 // Starts the IDE without waiting for it.
-async function launch(run: Run, os: Os, bin: string, target: string): Promise<boolean> {
+async function launch(run: Run, os: Os, bin: string, spot: Spot): Promise<boolean> {
+  const where: string[] = []
+  if (spot.file) {
+    if (spot.line !== undefined) where.push('--line', String(spot.line))
+    if (spot.line !== undefined && spot.column !== undefined) where.push('--column', String(spot.column))
+    where.push(spot.file)
+  }
   try {
     if (os === 'windows') {
-      const quote = '[char]34'
+      const q = '[char]34'
+      const args = [spot.project, ...where].map(a => (/^(--|\d+$)/.test(a) && a !== spot.project ? ps(a) : `${q} + ${ps(a)} + ${q}`))
       const { exitCode } = await run(
-        powershell(
-          `Start-Process -FilePath ${ps(bin)} -ArgumentList (${quote} + ${ps(target)} + ${quote})`,
-        ),
+        powershell(`Start-Process -FilePath ${ps(bin)} -ArgumentList ((${args.join(") + ' ' + (")}))`),
       )
 
       return exitCode === 0
@@ -101,10 +146,11 @@ async function launch(run: Run, os: Os, bin: string, target: string): Promise<bo
     const { exitCode } = await run([
       'sh',
       '-c',
-      'case "$1" in *.app) open -a "$1" "$2" ;; *) nohup "$1" "$2" >/dev/null 2>&1 </dev/null & ;; esac',
+      'bin="$1"; shift; case "$bin" in *.app) if [ "$#" -eq 1 ]; then open -a "$bin" "$1"; exit; fi; bin="$bin/Contents/MacOS/pycharm";; esac; nohup "$bin" "$@" >/dev/null 2>&1 </dev/null &',
       'sh',
       bin,
-      target,
+      spot.project,
+      ...where,
     ])
 
     return exitCode === 0
@@ -113,13 +159,16 @@ async function launch(run: Run, os: Os, bin: string, target: string): Promise<bo
   }
 }
 
-const notFoundBrief = (target: string): string =>
+const describe = (spot: Spot): string =>
+  spot.file ? `${spot.file}${spot.line !== undefined ? `:${spot.line}` : ''}` : spot.project
+
+const notFoundBrief = (spot: Spot): string =>
   [
-    `The person ran /pycharm to open ${target} in PyCharm, but no PyCharm launcher was found on PATH or in the usual install locations.`,
+    `The person ran /pycharm to open ${describe(spot)} in PyCharm, but no PyCharm launcher was found on PATH or in the usual install locations.`,
     'Find the PyCharm launcher on this machine yourself first:',
     '- Linux/macOS: search with find/mdfind/ls for `pycharm`, `pycharm.sh`, `charm`, or `PyCharm*.app` (JetBrains Toolbox, /opt, /snap/bin, /Applications, ~/Applications).',
     '- Windows: search with PowerShell Get-ChildItem for `pycharm64.exe` or `pycharm.cmd` (Program Files, %LOCALAPPDATA%\\Programs, JetBrains Toolbox).',
-    `When you find it, call the ${TOOL} tool with { "path": "<launcher>", "target": "${target}" }; it opens the project and saves the path for next time.`,
+    `When you find it, call the ${TOOL} tool with { "path": "<launcher>", "target": ${JSON.stringify(spot.project)}${spot.file ? `, "file": ${JSON.stringify(spot.file)}` : ''}${spot.line !== undefined ? `, "line": ${spot.line}` : ''} }; it opens the project and saves the path for next time.`,
     `If you cannot find it, ask the person in chat for the full path to PyCharm's launcher, then call ${TOOL} with the path they give.`,
     'Do not launch PyCharm any other way.',
   ].join('\n')
@@ -129,7 +178,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'pycharm',
       description: 'Open the project (or a given path) in PyCharm',
-      argumentHint: '[path | --reset]',
+      argumentHint: '[path[:line[:col]] | --reset]',
     })
     await $.tool.register({
       name: 'pycharm_open',
@@ -139,7 +188,9 @@ export const register: Register = on => {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Full path to the PyCharm launcher (pycharm, pycharm.sh, pycharm64.exe, pycharm.cmd or PyCharm.app).' },
-          target: { type: 'string', description: 'Folder to open; default is the session directory.' },
+          target: { type: 'string', description: 'Project folder to open; default is the session directory.' },
+          file: { type: 'string', description: 'Absolute path of a file to open inside the project.' },
+          line: { type: 'number', description: 'Line to jump to in `file`.' },
         },
       },
       isDeferred: false,
@@ -158,33 +209,37 @@ export const register: Register = on => {
       return { text: 'Saved PyCharm path cleared.' }
     }
 
-    const target = arg || (await $.session.cwd())
     const os = await detectOs($)
+    const spot = await resolveSpot($, run, os, arg)
     const saved = await $.store.get(STORE_KEY)
     let bin: string | undefined
     if (typeof saved === 'string' && (await exists(run, os, saved))) bin = saved
     bin ??= await findPyCharm(run, os)
 
     if (!bin) {
-      void $.prompt.submit({ text: notFoundBrief(target) })
+      void $.prompt.submit({ text: notFoundBrief(spot) })
 
       return { text: 'PyCharm not found automatically. Claude will look for it.' }
     }
 
     return {
-      text: (await launch(run, os, bin, target))
-        ? `Opening ${target} in PyCharm (${bin}).`
+      text: (await launch(run, os, bin, spot))
+        ? `Opening ${describe(spot)} in PyCharm (${bin}).`
         : `Could not start PyCharm at ${bin}. Run /pycharm --reset to forget a saved path.`,
     }
   })
 
   on('tool.call', async ($, e, next) => {
     // This plugin's own tool is not in the generated type tables, so read the input loosely.
-    const input = e as unknown as { tool: string; path?: unknown; target?: unknown }
+    const input = e as unknown as { tool: string; path?: unknown; target?: unknown; file?: unknown; line?: unknown }
     if (input.tool !== TOOL) return next(e)
     const run: Run = argv => $.process.run(argv)
     const os = await detectOs($)
-    const target = typeof input.target === 'string' && input.target ? input.target : await $.session.cwd()
+    const spot: Spot = {
+      project: typeof input.target === 'string' && input.target ? input.target : await $.session.cwd(),
+      file: typeof input.file === 'string' && input.file ? input.file : undefined,
+      line: typeof input.line === 'number' ? input.line : undefined,
+    }
     let bin: string | undefined
 
     if (typeof input.path === 'string' && input.path.trim()) {
@@ -200,8 +255,8 @@ export const register: Register = on => {
     if (!bin) return { deny: 'PyCharm launcher not found; pass its full path as `path`.' }
 
     return {
-      result: (await launch(run, os, bin, target))
-        ? `Opened ${target} in PyCharm (${bin}); path saved for next time.`
+      result: (await launch(run, os, bin, spot))
+        ? `Opened ${describe(spot)} in PyCharm (${bin}); path saved for next time.`
         : `Could not start PyCharm at ${bin}.`,
     }
   })
